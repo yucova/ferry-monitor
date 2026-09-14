@@ -3,7 +3,7 @@ name: Ferry Seat Monitor
 on:
   schedule:
     # 9月14〜22日（UTC）の5分おき。期間外は動きません
-    - cron: '*/5 * 14-22 9 *'
+    - cron: '*/5 * 14-21 9 *'
   workflow_dispatch:
     inputs:
       test_notify:
