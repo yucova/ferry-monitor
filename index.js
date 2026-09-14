@@ -7,8 +7,7 @@ const fs = require('fs');
 // 監視条件（ここだけ書き換えれば他の日・他の航路にも使えます）
 // ============================================================
 const CONFIG = {
-  entryUrl:    'https://booking.ferry-sunflower.co.jp/web/yoyaku/Reserve1030/Index',
-  fallbackUrl: 'https://booking.ferry-sunflower.co.jp/web/yoyaku/Reserve/ReturnToTop',
+  topUrl:      'https://booking.ferry-sunflower.co.jp/web/yoyaku/',
   bookingUrl:  'https://booking.ferry-sunflower.co.jp/web/yoyaku/',
 
   targetDate: { y: 2026, m: 9, d: 21 },   // 乗船日
@@ -127,20 +126,44 @@ async function run() {
   await page.setExtraHTTPHeaders({ 'Accept-Language': 'ja,en;q=0.8' });
 
   try {
-    // ---- 1. 利用内容入力画面（Reserve1030）----
-    console.log('1. 利用内容入力画面へアクセス');
-    await page.goto(CONFIG.entryUrl, { waitUntil: 'networkidle2', timeout: 45000 });
-
-    if (!(await page.$('#date'))) {
-      console.log('   直リンクで出なかったので予約TOP経由を試します');
-      await page.goto(CONFIG.fallbackUrl, { waitUntil: 'networkidle2', timeout: 45000 });
-      await page.waitForSelector('#date', { timeout: 20000 });
-    }
+    // ---- 1. 予約TOP -> 「ログインせず運賃を調べる」-> 利用内容入力（Reserve1030）----
+    // 注意: 予約TOPにも #date があるが、それは「予約照会」用（name=Inquery_BoardingDate）。
+    //       利用内容入力画面に来たかどうかは #Ouro_Line の有無で判定する。
+    console.log('1. 予約TOPへアクセス');
+    await page.goto(CONFIG.topUrl, { waitUntil: 'networkidle2', timeout: 45000 });
     console.log('   現在URL: ' + page.url());
+
+    if (!(await page.$('#Ouro_Line'))) {
+      console.log('   「ログインせず運賃を調べる」をクリック');
+      await page.waitForSelector('button.btn-Reserve', { timeout: 20000 });
+      const navOk = await Promise.all([
+        page.click('button.btn-Reserve'),
+        page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }),
+      ]).then(function () { return true; }).catch(function () { return false; });
+      console.log('   クリック後URL: ' + page.url() + '（遷移検知: ' + navOk + '）');
+
+      if (!(await page.$('#Ouro_Line'))) {
+        console.log('   ボタンで進めなかったので form#Reserve を直接送信します');
+        await Promise.all([
+          page.evaluate(function () {
+            const f = document.getElementById('Reserve');
+            if (f) f.submit();
+          }),
+          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }),
+        ]).catch(function () { /* 遷移済みなら何もしない */ });
+        console.log('   再送信後URL: ' + page.url());
+      }
+    }
+
+    await page.waitForSelector('#Ouro_Line', { timeout: 20000 });
+    console.log('   利用内容入力画面に到達: ' + page.url());
 
     // ---- 2-1. 乗船日（jQuery UI datepicker の API 経由で正しい書式にさせる）----
     const dateSet = await page.evaluate(function (t) {
-      const el = document.getElementById('date');
+      // 乗船日欄は name で特定する（予約照会用の #date と取り違えないため）
+      const el = document.querySelector('input[name="Ouro_BoardingDate"]')
+              || document.getElementById('date');
+      if (!el) return { via: 'not-found', value: '' };
       const jq = window.jQuery || window.$;
       if (jq && jq(el).hasClass('hasDatepicker')) {
         jq(el).datepicker('setDate', new Date(t.y, t.m - 1, t.d));
