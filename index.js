@@ -4,28 +4,30 @@ const puppeteer = require('puppeteer');
 const fs = require('fs');
 
 // ============================================================
-// 監視条件（ここだけ書き換えれば他の日・他の航路にも使えます）
+// 監視条件
 // ============================================================
 const CONFIG = {
   topUrl:     'https://booking.ferry-sunflower.co.jp/web/yoyaku/',
   bookingUrl: 'https://booking.ferry-sunflower.co.jp/web/yoyaku/',
 
-  // 監視したい乗船日。いくつでも並べられます。
-  // 出港日を過ぎた日は自動でスキップします（エラーになりません）
+  // 監視する乗船日（出港日を過ぎた日は自動スキップ）
   targetDates: [
-    { y: 2026, m: 9, d: 21 },
-    { y: 2026, m: 9, d: 22 },
+    { y: 2026, m: 9, d: 21 },   // 大阪1 19:05発 さんふらわあ くれない
   ],
 
   ouroLine:   '21',                      // 21 = 大阪1 → 別府
   josenNaiyo: '03',                      // 03 = 徒歩でご利用
-  passengers: { '大人': 1, '幼児': 1 },  // ラベル文字列 → 人数
+  passengers: { '大人': 1, '幼児': 1 },
 
+  // すでに確保済みの部屋（乗り換え判断のため、差額を出すのに使う）
+  holding: { grade: 'スーペリアシングル', fare: 23430 },
+
+  // 狙う部屋（希望順。name は「空白を除いたページ上の表記」と完全一致させること）
+  // ※「プライベート ｼﾝｸﾞﾙ ﾂｲﾝ」はページ上が半角カナ。全角で書くと一生ヒットしません
   targetGrades: [
-    'スーペリアシングル',
-    'スタンダードシングル',
-    'プライベートシングル',
-    'プライベートベッドレディース',
+    { rank: 1, name: 'プライベートｼﾝｸﾞﾙﾂｲﾝ',       label: 'プライベート シングルツイン' },
+    { rank: 2, name: 'プライベートシングル',         label: 'プライベートシングル' },
+    { rank: 3, name: 'プライベートベッドレディース', label: 'プライベートベッドレディース' },
   ],
 
   // --- 通知の間引き ---
@@ -36,8 +38,8 @@ const CONFIG = {
   // --- 静音時間（日本時間）---
   // この時間帯はLINEを鳴らしません（Slackには記録として残ります）。
   // 明けた直後のチェックで、まだ空いていればLINEが飛びます。
-  quietFromJST: 1,   // 1時から
-  quietToJST:   5,   // 5時まで
+  quietFromJST: 1,
+  quietToJST:   5,
 };
 
 const STATE_FILE = 'state/last.json';
@@ -63,6 +65,16 @@ function ymdNum(t) {
   return t.y * 10000 + t.m * 100 + t.d;
 }
 
+function yen(n) {
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',') + '円';
+}
+
+// '18,430円' -> 18430 （読めなければ 0）
+function parseFare(s) {
+  const m = String(s).replace(/,/g, '').match(/\d+/);
+  return m ? Number(m[0]) : 0;
+}
+
 // 実行環境のタイムゾーンによらず「日本時間の今」を出す
 function nowJST() {
   const now = new Date();
@@ -74,7 +86,6 @@ function todayJST() {
   return { y: j.getFullYear(), m: j.getMonth() + 1, d: j.getDate() };
 }
 
-// 静音時間帯か（from <= h < to。深夜またぎにも対応）
 function isQuietJST() {
   const h = nowJST().getHours();
   const a = CONFIG.quietFromJST;
@@ -160,7 +171,9 @@ async function sendLine(message) {
 }
 
 function buildMessage(groups, key) {
-  let msg = '【さんふらわあ 空席発生】\n区間: 大阪1 -> 別府（徒歩・大人1/幼児1）\n';
+  let msg = '【さんふらわあ 空席発生】\n'
+    + '区間: 大阪1 -> 別府（徒歩・大人1/幼児1）\n'
+    + '確保済み: ' + CONFIG.holding.grade + ' ' + yen(CONFIG.holding.fare) + '\n';
   for (let i = 0; i < groups.length; i++) {
     if (groups[i][key].length === 0) continue;
     msg += '\n■ ' + groups[i].label + '\n';
@@ -227,7 +240,7 @@ async function checkOneDate(page, target) {
   // ---- 2-2. ご利用区間 ----
   await page.select('#Ouro_Line', CONFIG.ouroLine);
 
-  // ---- 2-3. ご乗船内容（徒歩）。車輌欄が消えるのを待って確認 ----
+  // ---- 2-3. ご乗船内容（徒歩）----
   await page.click('#JosenNaiyo' + CONFIG.josenNaiyo);
   await page
     .waitForFunction(function () {
@@ -296,6 +309,7 @@ async function checkOneDate(page, target) {
   // ---- 4. 空席テーブルの解析 ----
   const result = await page.evaluate(function (targets) {
     const rows = [];
+    const seen = [];
     const tables = document.querySelectorAll('table.tbl-vacancy');
 
     for (let i = 0; i < tables.length; i++) {
@@ -326,29 +340,41 @@ async function checkOneDate(page, target) {
 
         // 等級セルを名前で特定 -> 空席状況はその3つ右（等級/イメージ/運賃/空席状況）
         let gi = -1;
-        let grade = null;
+        let hit = null;
         for (let k = 0; k < cells.length && gi === -1; k++) {
           for (let t = 0; t < targets.length; t++) {
-            if (cells[k].indexOf(targets[t]) !== -1) { gi = k; grade = targets[t]; break; }
+            if (cells[k].indexOf(targets[t].name) !== -1) { gi = k; hit = targets[t]; break; }
           }
         }
-        if (gi === -1) continue;
+        if (gi === -1) {
+          // 監視対象外の行も、名前だけ控えておく（表記ゆれの調査用）
+          if (cells.length >= 4 && cells[1]) seen.push(cells[1]);
+          continue;
+        }
 
         rows.push({
           sailing: ttl,
-          grade: grade,
+          rank: hit.rank,
+          name: hit.name,
+          label: hit.label,
           fare: cells[gi + 2] || '',
           status: cells[gi + 3] || '',
         });
       }
     }
-    return { rows: rows, tableCount: tables.length };
+    return { rows: rows, seen: seen, tableCount: tables.length };
   }, CONFIG.targetGrades);
 
+  if (result.rows.length !== CONFIG.targetGrades.length) {
+    console.log('  !! 監視対象 ' + CONFIG.targetGrades.length + '件のうち '
+      + result.rows.length + '件しか見つかりません');
+    console.log('     ページ上の等級名: ' + JSON.stringify(result.seen));
+  }
   if (result.rows.length === 0) {
-    console.log('  !! 対象の等級が1行も見つかりません');
     return { sailing: '', rows: [] };
   }
+
+  result.rows.sort(function (a, b) { return a.rank - b.rank; });
 
   // ---- 5. 判定（ページ凡例どおり: ○ または 1以上の数字 = 空席あり）----
   const rows = [];
@@ -363,9 +389,12 @@ async function checkOneDate(page, target) {
     const hasMark  = s.indexOf('○') !== -1 || s.indexOf('◯') !== -1 || s.indexOf('〇') !== -1;
     const open = !isFull && !isNoSale && !isWait && (hasMark || num >= 1);
 
-    console.log('  【判定】' + r.grade + ' [' + s + '] ' + r.fare
+    console.log('  【第' + r.rank + '希望】' + r.label + ' [' + s + '] ' + r.fare
       + ' -> ' + (open ? '★空きあり' : '空きなし'));
-    rows.push({ grade: r.grade, status: s, fare: r.fare, open: open });
+    rows.push({
+      rank: r.rank, name: r.name, label: r.label,
+      status: s, fare: r.fare, open: open,
+    });
   }
 
   return { sailing: result.rows[0].sailing || '', rows: rows };
@@ -377,6 +406,8 @@ async function run() {
   const j = nowJST();
   const quiet = isQuietJST();
   console.log('=== さんふらわあ空席監視 [' + dateList + '] 大阪1 -> 別府(徒歩) ===');
+  console.log('確保済み: ' + CONFIG.holding.grade + ' ' + yen(CONFIG.holding.fare)
+    + ' → これより安い部屋を探します');
   console.log('日本時間 ' + j.getFullYear() + '/' + String(j.getMonth() + 1).padStart(2, '0')
     + '/' + String(j.getDate()).padStart(2, '0') + ' '
     + String(j.getHours()).padStart(2, '0') + ':' + String(j.getMinutes()).padStart(2, '0')
@@ -387,7 +418,8 @@ async function run() {
     console.log('*** TEST_NOTIFY=true のため、通知テストのみ実行します ***');
     const msg = '【テスト送信】さんふらわあ空席監視\n'
       + 'この文面が届いていれば、通知の設定は正常です。\n'
-      + '監視対象: ' + dateList + ' 大阪1 -> 別府（徒歩・大人1/幼児1）';
+      + '監視対象: ' + dateList + ' 大阪1 -> 別府（徒歩・大人1/幼児1）\n'
+      + '確保済み: ' + CONFIG.holding.grade + ' ' + yen(CONFIG.holding.fare);
     const a = await sendSlack(msg);
     const b = await sendLine(msg);
     if (!a && !b) process.exitCode = 1;
@@ -438,7 +470,6 @@ async function run() {
         failed++;
         console.error('  !! エラー(' + label + '): ' + e.message);
         await saveDebug(page, 'error-' + tagDate(t));
-        // 失敗した日は前回の状態をそのまま持ち越す（取りこぼし防止）
         if (prev) {
           const keys = Object.keys(prev);
           for (let k = 0; k < keys.length; k++) {
@@ -453,7 +484,7 @@ async function run() {
 
       for (let jj = 0; jj < r.rows.length; jj++) {
         const row = r.rows[jj];
-        const key = label + '|' + row.grade;
+        const key = label + '|' + row.name;
         const was = prev ? prev[key] : null;
 
         if (!row.open) {
@@ -463,7 +494,13 @@ async function run() {
 
         openCount++;
         const fresh = !was || !was.open;
-        const text = '・' + row.grade + '：【' + row.status + '】 ' + row.fare;
+
+        const f = parseFare(row.fare);
+        const diff = (f > 0 && CONFIG.holding.fare > 0) ? (CONFIG.holding.fare - f) : 0;
+        const diffTxt = diff > 0 ? '（' + yen(diff) + ' 安い）'
+                      : (diff < 0 ? '（' + yen(-diff) + ' 高い）' : '');
+        const text = '【第' + row.rank + '希望】' + row.label
+          + '：' + row.status + '　' + row.fare + diffTxt;
 
         const slackDue = fresh || (now - (was.lastSlack || 0)) >= remindSlackMs;
         const lineDue  = (fresh || (now - (was.lastLine || 0)) >= remindLineMs) && !quiet;
@@ -477,8 +514,7 @@ async function run() {
           lastLine:  lineDue  ? now : ((was && was.lastLine)  || 0),
         };
 
-        console.log('  → ' + row.grade + ': '
-          + (fresh ? '新規' : '継続中')
+        console.log('  → ' + row.label + ': ' + (fresh ? '新規' : '継続中')
           + ' / Slack ' + (slackDue ? '送る' : '見送り')
           + ' / LINE ' + (lineDue ? '送る' : (quiet ? '静音中' : '見送り')));
       }
@@ -505,9 +541,9 @@ async function run() {
         console.log('> 空席は続いていますが、通知済みのため今回は送りません'
           + (quiet ? '（静音時間帯。明けたらLINEも鳴らします）' : ''));
       } else if (checked > 0) {
-        console.log('> 対象等級に空きなし。監視を継続します。');
+        console.log('> 希望3タイプに空きなし。監視を継続します。');
       } else if (failed === 0) {
-        console.log('> 監視対象の日付がすべて過ぎています。ワークフローを止めて構いません。');
+        console.log('> 監視対象の日付が過ぎています。ワークフローを止めて構いません。');
       }
     }
   } finally {
