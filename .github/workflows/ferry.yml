@@ -2,14 +2,19 @@ name: Ferry Seat Monitor
 
 on:
   schedule:
-    # 9月14〜21日（UTC）の20分おき。期間外は動きません
-    - cron: '*/20 * 14-22 9 *'
+    # 9月14〜22日（UTC）の5分おき。期間外は動きません
+    - cron: '*/5 * 14-22 9 *'
   workflow_dispatch:
     inputs:
       test_notify:
         description: '通知テストだけ行う（サイトは見ない）'
         type: boolean
         default: false
+
+# 前の回が終わる前に次が始まらないようにする（状態ファイルの取り合い防止）
+concurrency:
+  group: ferry-monitor
+  cancel-in-progress: false
 
 jobs:
   check:
@@ -21,6 +26,24 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
+
+      # Chrome と npm のダウンロードを使い回して1回あたりを短くする
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            ~/.cache/puppeteer
+          key: deps-${{ runner.os }}-${{ hashFiles('package.json') }}
+
+      # 「前回どこが空いていたか」を引き継ぐ（同じ空席で何度も通知しないため）
+      - name: Restore last state
+        uses: actions/cache@v4
+        with:
+          path: state
+          key: ferry-state-${{ github.run_id }}
+          restore-keys: |
+            ferry-state-
 
       - run: npm install
 
@@ -35,6 +58,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: debug
+          name: debug-${{ github.run_id }}
           path: debug/
           if-no-files-found: ignore
