@@ -1,0 +1,40 @@
+name: Ferry Seat Monitor
+
+on:
+  schedule:
+    # 9月14〜21日（UTC）の20分おき。期間外は動きません
+    - cron: '*/20 * 14-21 9 *'
+  workflow_dispatch:
+    inputs:
+      test_notify:
+        description: '通知テストだけ行う（サイトは見ない）'
+        type: boolean
+        default: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - run: npm install
+
+      - name: Run monitor script
+        env:
+          SLACK_WEBHOOK_URL:         ${{ secrets.SLACK_WEBHOOK_URL }}
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_USER_ID:              ${{ secrets.LINE_USER_ID }}
+          TEST_NOTIFY:               ${{ inputs.test_notify }}
+        run: node index.js
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: debug
+          path: debug/
+          if-no-files-found: ignore
