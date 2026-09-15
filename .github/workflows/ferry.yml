@@ -3,7 +3,8 @@ name: Ferry Seat Monitor
 on:
   schedule:
     # 9月14〜22日（UTC）の5分おき。期間外は動きません
-    - cron: '*/5 * 14-21 9 *'
+    # フェリー(9/21)と楽天(9/22チェックイン)は、それぞれ日付を過ぎると自動でスキップします
+    - cron: '*/5 * 14-22 9 *'
   workflow_dispatch:
     inputs:
       test_notify:
@@ -19,7 +20,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -54,6 +55,16 @@ jobs:
           LINE_USER_ID:              ${{ secrets.LINE_USER_ID }}
           TEST_NOTIFY:               ${{ inputs.test_notify }}
         run: node index.js
+
+      # 楽天トラベル。フェリー側が失敗しても必ず実行する
+      - name: Run rakuten monitor
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL:         ${{ secrets.SLACK_WEBHOOK_URL }}
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_USER_ID:              ${{ secrets.LINE_USER_ID }}
+          TEST_NOTIFY:               ${{ inputs.test_notify }}
+        run: node rakuten.js
 
       - uses: actions/upload-artifact@v4
         if: always()
