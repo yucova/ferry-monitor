@@ -383,6 +383,23 @@ async function checkOne(page, target) {
         up = up.parentElement;
       }
 
+      // 見出し行から列の位置を読む。片道は6列（運賃あり）、往復は5列（運賃なし）で
+      // 空席状況の位置がズレるため、決め打ちにしない
+      const heads = [];
+      const ths = tbl.querySelectorAll('thead th');
+      for (let k = 0; k < ths.length; k++) {
+        heads.push(ths[k].innerText.replace(/\s+/g, ''));
+      }
+      let gradeIdx = -1, statusIdx = -1, fareIdx = -1;
+      for (let k = 0; k < heads.length; k++) {
+        if (gradeIdx === -1 && heads[k].indexOf('等級') !== -1) gradeIdx = k;
+        if (statusIdx === -1 && heads[k].indexOf('空席状況') !== -1) statusIdx = k;
+        if (fareIdx === -1 && heads[k].indexOf('運賃') !== -1) fareIdx = k;
+      }
+      // 読めなければ従来どおり（等級の3つ右＝片道の並び）
+      const statusOff = (gradeIdx !== -1 && statusIdx !== -1) ? statusIdx - gradeIdx : 3;
+      const fareOff   = (gradeIdx !== -1 && fareIdx   !== -1) ? fareIdx   - gradeIdx : -1;
+
       const trs = tbl.querySelectorAll('tbody tr');
       for (let j = 0; j < trs.length; j++) {
         const cellNodes = trs[j].querySelectorAll('th, td');
@@ -409,8 +426,8 @@ async function checkOne(page, target) {
           rank: hit.rank,
           name: hit.name,
           label: hit.label,
-          fare: cells[gi + 2] || '',
-          status: cells[gi + 3] || '',
+          fare: fareOff >= 0 ? (cells[gi + fareOff] || '') : '',
+          status: cells[gi + statusOff] || '',
         });
       }
     }
