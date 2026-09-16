@@ -6,28 +6,39 @@ const fs = require('fs');
 // ============================================================
 // 監視条件
 // ============================================================
+// 区間コード: 11=神戸→大分 / 12=大分→神戸 / 21=大阪1→別府 / 22=別府→大阪1
+//             31=大阪2→志布志 / 32=志布志→大阪2
+// 等級名は「空白を除いたページ上の表記」と完全一致させること。
+// ※「プライベート ｼﾝｸﾞﾙ ﾂｲﾝ」はページ上が半角カナ。全角で書くと一生ヒットしません。
+const TWIN = { rank: 1, name: 'プライベートｼﾝｸﾞﾙﾂｲﾝ', label: 'プライベート シングルツイン' };
+
 const CONFIG = {
   topUrl:     'https://booking.ferry-sunflower.co.jp/web/yoyaku/',
   bookingUrl: 'https://booking.ferry-sunflower.co.jp/web/yoyaku/',
 
-  // 監視する乗船日（出港日を過ぎた日は自動スキップ）
-  targetDates: [
-    { y: 2026, m: 9, d: 21 },   // 大阪1 19:05発 さんふらわあ くれない
-  ],
-
-  ouroLine:   '21',                      // 21 = 大阪1 → 別府
   josenNaiyo: '03',                      // 03 = 徒歩でご利用
   passengers: { '大人': 1, '幼児': 1 },
 
-  // すでに確保済みの部屋（乗り換え判断のため、差額を出すのに使う）
-  holding: { grade: 'スーペリアシングル', fare: 23430 },
-
-  // 狙う部屋（希望順。name は「空白を除いたページ上の表記」と完全一致させること）
-  // ※「プライベート ｼﾝｸﾞﾙ ﾂｲﾝ」はページ上が半角カナ。全角で書くと一生ヒットしません
-  targetGrades: [
-    { rank: 1, name: 'プライベートｼﾝｸﾞﾙﾂｲﾝ',       label: 'プライベート シングルツイン' },
-    { rank: 2, name: 'プライベートシングル',         label: 'プライベートシングル' },
-    { rank: 3, name: 'プライベートベッドレディース', label: 'プライベートベッドレディース' },
+  // 監視する便。出港日を過ぎたものは自動でスキップします
+  targets: [
+    {
+      y: 2026, m: 9, d: 21, line: '21',
+      route: '大阪1 → 別府',
+      holding: 'プライベートシングル（確保済み）',
+      grades: [TWIN],
+    },
+    {
+      y: 2026, m: 9, d: 23, line: '21',
+      route: '大阪1 → 別府（往路）',
+      holding: 'プライベートシングル（仮押さえ済み）',
+      grades: [TWIN],
+    },
+    {
+      y: 2026, m: 9, d: 24, line: '22',
+      route: '別府 → 大阪1（復路）',
+      holding: 'プライベートシングル（仮押さえ済み）',
+      grades: [TWIN],
+    },
   ],
 
   // --- 通知の間引き ---
@@ -40,6 +51,11 @@ const CONFIG = {
   // 明けた直後のチェックで、まだ空いていればLINEが飛びます。
   quietFromJST: 1,
   quietToJST:   5,
+
+  // --- 予約サイトの定期メンテナンス（日本時間）---
+  // この時間帯は最初から見に行かず、エラーにもしません。前後に余裕を持たせています。
+  maintenanceFromJST: '02:50',
+  maintenanceToJST:   '05:20',
 };
 
 const STATE_FILE = 'state/last.json';
@@ -58,21 +74,11 @@ function fmtDate(t) {
 }
 
 function tagDate(t) {
-  return String(t.y) + String(t.m).padStart(2, '0') + String(t.d).padStart(2, '0');
+  return String(t.y) + String(t.m).padStart(2, '0') + String(t.d).padStart(2, '0') + '-' + t.line;
 }
 
 function ymdNum(t) {
   return t.y * 10000 + t.m * 100 + t.d;
-}
-
-function yen(n) {
-  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',') + '円';
-}
-
-// '18,430円' -> 18430 （読めなければ 0）
-function parseFare(s) {
-  const m = String(s).replace(/,/g, '').match(/\d+/);
-  return m ? Number(m[0]) : 0;
 }
 
 // 実行環境のタイムゾーンによらず「日本時間の今」を出す
@@ -91,6 +97,26 @@ function isQuietJST() {
   const a = CONFIG.quietFromJST;
   const b = CONFIG.quietToJST;
   return a <= b ? (h >= a && h < b) : (h >= a || h < b);
+}
+
+// 予約サイトのメンテナンス時間帯か（"HH:MM" を分に直して比較。日またぎにも対応）
+function inMaintenanceJST() {
+  const toMin = function (s) {
+    const p = String(s).split(':');
+    return Number(p[0]) * 60 + Number(p[1] || 0);
+  };
+  const j = nowJST();
+  const now = j.getHours() * 60 + j.getMinutes();
+  const a = toMin(CONFIG.maintenanceFromJST);
+  const b = toMin(CONFIG.maintenanceToJST);
+  return a <= b ? (now >= a && now < b) : (now >= a || now < b);
+}
+
+// メンテナンス等でページが出ないときに投げる印つきのエラー
+function skipError(msg) {
+  const e = new Error(msg);
+  e.isSkip = true;
+  return e;
 }
 
 function loadState() {
@@ -171,13 +197,12 @@ async function sendLine(message) {
 }
 
 function buildMessage(groups, key) {
-  let msg = '【さんふらわあ 空席発生】\n'
-    + '区間: 大阪1 -> 別府（徒歩・大人1/幼児1）\n'
-    + '確保済み: ' + CONFIG.holding.grade + ' ' + yen(CONFIG.holding.fare) + '\n';
+  let msg = '【さんふらわあ 空席発生】\n徒歩・大人1/幼児1\n';
   for (let i = 0; i < groups.length; i++) {
     if (groups[i][key].length === 0) continue;
-    msg += '\n■ ' + groups[i].label + '\n';
+    msg += '\n■ ' + groups[i].label + '　' + groups[i].route + '\n';
     if (groups[i].sailing) msg += groups[i].sailing + '\n';
+    msg += '（いま ' + groups[i].holding + '）\n';
     msg += groups[i][key].join('\n') + '\n';
   }
   msg += '\n▼すぐ予約\n' + CONFIG.bookingUrl;
@@ -185,16 +210,31 @@ function buildMessage(groups, key) {
 }
 
 // ============================================================
-// 1日分をチェックする
+// 1便分をチェックする
 // ============================================================
-async function checkOneDate(page, target) {
+async function checkOne(page, target) {
   // ---- 1. 予約TOP -> 「ログインせず運賃を調べる」-> 利用内容入力（Reserve1030）----
   // 注意: 予約TOPにも #date があるが、それは「予約照会」用（name=Inquery_BoardingDate）。
   //       利用内容入力画面に来たかどうかは #Ouro_Line の有無で判定する。
   await page.goto(CONFIG.topUrl, { waitUntil: 'networkidle2', timeout: 45000 });
 
   if (!(await page.$('#Ouro_Line'))) {
-    await page.waitForSelector('button.btn-Reserve', { timeout: 20000 });
+    try {
+      await page.waitForSelector('button.btn-Reserve', { timeout: 20000 });
+    } catch (e) {
+      // ボタンが出ない＝メンテナンス中や障害の可能性。ページの文言で見分ける
+      const note = await page.evaluate(function () {
+        return (document.body ? document.body.innerText : '').replace(/\s+/g, ' ').slice(0, 300);
+      });
+      const words = ['メンテナンス', 'ただいま', '停止', 'ご利用いただけません', 'しばらく'];
+      let hit = false;
+      for (let i = 0; i < words.length; i++) {
+        if (note.indexOf(words[i]) !== -1) { hit = true; break; }
+      }
+      if (hit) throw skipError('予約サイトが一時的に利用できません: ' + note.slice(0, 120));
+      throw new Error('予約TOPに「ログインせず運賃を調べる」が出ません。画面文言: ' + note.slice(0, 120));
+    }
+
     await Promise.all([
       page.click('button.btn-Reserve'),
       page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }),
@@ -233,12 +273,25 @@ async function checkOneDate(page, target) {
     el.value = v;
     el.dispatchEvent(new Event('change', { bubbles: true }));
     return { via: 'manual', value: el.value };
-  }, target);
+  }, { y: target.y, m: target.m, d: target.d });
   console.log('  乗船日: "' + dateSet.value + '" [' + dateSet.via + ']');
   if (!dateSet.value) throw new Error('乗船日が入力できていません（選択可能な期間外かもしれません）');
 
-  // ---- 2-2. ご利用区間 ----
-  await page.select('#Ouro_Line', CONFIG.ouroLine);
+  // ---- 2-2. ご利用区間（往路・復路で切り替わる）----
+  const lineOk = await page.evaluate(function (v) {
+    const sel = document.getElementById('Ouro_Line');
+    if (!sel) return '';
+    for (let i = 0; i < sel.options.length; i++) {
+      if (sel.options[i].value === v) {
+        sel.value = v;
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        return sel.options[i].textContent.replace(/\s+/g, '');
+      }
+    }
+    return '';
+  }, target.line);
+  if (!lineOk) throw new Error('区間コード ' + target.line + ' が選択肢にありません');
+  console.log('  区間: ' + lineOk + '（' + target.line + '）');
 
   // ---- 2-3. ご乗船内容（徒歩）----
   await page.click('#JosenNaiyo' + CONFIG.josenNaiyo);
@@ -347,7 +400,6 @@ async function checkOneDate(page, target) {
           }
         }
         if (gi === -1) {
-          // 監視対象外の行も、名前だけ控えておく（表記ゆれの調査用）
           if (cells.length >= 4 && cells[1]) seen.push(cells[1]);
           continue;
         }
@@ -363,16 +415,14 @@ async function checkOneDate(page, target) {
       }
     }
     return { rows: rows, seen: seen, tableCount: tables.length };
-  }, CONFIG.targetGrades);
+  }, target.grades);
 
-  if (result.rows.length !== CONFIG.targetGrades.length) {
-    console.log('  !! 監視対象 ' + CONFIG.targetGrades.length + '件のうち '
+  if (result.rows.length !== target.grades.length) {
+    console.log('  !! 監視対象 ' + target.grades.length + '件のうち '
       + result.rows.length + '件しか見つかりません');
     console.log('     ページ上の等級名: ' + JSON.stringify(result.seen));
   }
-  if (result.rows.length === 0) {
-    return { sailing: '', rows: [] };
-  }
+  if (result.rows.length === 0) return { sailing: '', rows: [] };
 
   result.rows.sort(function (a, b) { return a.rank - b.rank; });
 
@@ -391,10 +441,7 @@ async function checkOneDate(page, target) {
 
     console.log('  【第' + r.rank + '希望】' + r.label + ' [' + s + '] ' + r.fare
       + ' -> ' + (open ? '★空きあり' : '空きなし'));
-    rows.push({
-      rank: r.rank, name: r.name, label: r.label,
-      status: s, fare: r.fare, open: open,
-    });
+    rows.push({ rank: r.rank, name: r.name, label: r.label, status: s, fare: r.fare, open: open });
   }
 
   return { sailing: result.rows[0].sailing || '', rows: rows };
@@ -402,27 +449,34 @@ async function checkOneDate(page, target) {
 
 // ============================================================
 async function run() {
-  const dateList = CONFIG.targetDates.map(fmtDate).join(' / ');
   const j = nowJST();
   const quiet = isQuietJST();
-  console.log('=== さんふらわあ空席監視 [' + dateList + '] 大阪1 -> 別府(徒歩) ===');
-  console.log('確保済み: ' + CONFIG.holding.grade + ' ' + yen(CONFIG.holding.fare)
-    + ' → これより安い部屋を探します');
-  console.log('日本時間 ' + j.getFullYear() + '/' + String(j.getMonth() + 1).padStart(2, '0')
-    + '/' + String(j.getDate()).padStart(2, '0') + ' '
+  console.log('=== さんふらわあ空席監視（徒歩・大人1/幼児1）===');
+  for (let i = 0; i < CONFIG.targets.length; i++) {
+    const t = CONFIG.targets[i];
+    console.log('  ・' + fmtDate(t) + ' ' + t.route + ' / いま ' + t.holding);
+  }
+  console.log('日本時間 ' + fmtDate({ y: j.getFullYear(), m: j.getMonth() + 1, d: j.getDate() }) + ' '
     + String(j.getHours()).padStart(2, '0') + ':' + String(j.getMinutes()).padStart(2, '0')
     + (quiet ? '（静音時間帯：LINEは鳴らしません）' : ''));
 
   // --- 通知テストモード ---
   if (TEST_NOTIFY) {
     console.log('*** TEST_NOTIFY=true のため、通知テストのみ実行します ***');
+    const list = CONFIG.targets.map(function (t) { return fmtDate(t) + ' ' + t.route; }).join('\n');
     const msg = '【テスト送信】さんふらわあ空席監視\n'
-      + 'この文面が届いていれば、通知の設定は正常です。\n'
-      + '監視対象: ' + dateList + ' 大阪1 -> 別府（徒歩・大人1/幼児1）\n'
-      + '確保済み: ' + CONFIG.holding.grade + ' ' + yen(CONFIG.holding.fare);
+      + 'この文面が届いていれば、通知の設定は正常です。\n\n' + list;
     const a = await sendSlack(msg);
     const b = await sendLine(msg);
     if (!a && !b) process.exitCode = 1;
+    return;
+  }
+
+  // 予約サイトのメンテナンス時間帯は、見に行かずに静かに終わる
+  if (inMaintenanceJST()) {
+    console.log('> 予約サイトのメンテナンス時間帯（'
+      + CONFIG.maintenanceFromJST + '〜' + CONFIG.maintenanceToJST
+      + '）のため、今回はスキップします。');
     return;
   }
 
@@ -447,15 +501,17 @@ async function run() {
   const today = todayJST();
   const groups = [];
   let checked = 0;
+  let skipped = 0;
   let failed = 0;
   let openCount = 0;
 
   try {
-    for (let i = 0; i < CONFIG.targetDates.length; i++) {
-      const t = CONFIG.targetDates[i];
+    for (let i = 0; i < CONFIG.targets.length; i++) {
+      const t = CONFIG.targets[i];
       const label = fmtDate(t);
+      const keyHead = label + '|' + t.line + '|';
       console.log('');
-      console.log('########## ' + label + ' ##########');
+      console.log('########## ' + label + ' ' + t.route + ' ##########');
 
       if (ymdNum(t) < ymdNum(today)) {
         console.log('  出港日を過ぎているのでスキップします');
@@ -464,16 +520,21 @@ async function run() {
 
       let r;
       try {
-        r = await checkOneDate(page, t);
+        r = await checkOne(page, t);
         checked++;
       } catch (e) {
-        failed++;
-        console.error('  !! エラー(' + label + '): ' + e.message);
-        await saveDebug(page, 'error-' + tagDate(t));
+        if (e.isSkip) {
+          console.log('  > スキップ: ' + e.message);
+          skipped++;
+        } else {
+          failed++;
+          console.error('  !! エラー: ' + e.message);
+          await saveDebug(page, 'error-' + tagDate(t));
+        }
         if (prev) {
           const keys = Object.keys(prev);
           for (let k = 0; k < keys.length; k++) {
-            if (keys[k].indexOf(label + '|') === 0) next[keys[k]] = prev[keys[k]];
+            if (keys[k].indexOf(keyHead) === 0) next[keys[k]] = prev[keys[k]];
           }
         }
         continue;
@@ -484,7 +545,7 @@ async function run() {
 
       for (let jj = 0; jj < r.rows.length; jj++) {
         const row = r.rows[jj];
-        const key = label + '|' + row.name;
+        const key = keyHead + row.name;
         const was = prev ? prev[key] : null;
 
         if (!row.open) {
@@ -494,13 +555,7 @@ async function run() {
 
         openCount++;
         const fresh = !was || !was.open;
-
-        const f = parseFare(row.fare);
-        const diff = (f > 0 && CONFIG.holding.fare > 0) ? (CONFIG.holding.fare - f) : 0;
-        const diffTxt = diff > 0 ? '（' + yen(diff) + ' 安い）'
-                      : (diff < 0 ? '（' + yen(-diff) + ' 高い）' : '');
-        const text = '【第' + row.rank + '希望】' + row.label
-          + '：' + row.status + '　' + row.fare + diffTxt;
+        const text = '・' + row.label + '：' + row.status + '　' + row.fare;
 
         const slackDue = fresh || (now - (was.lastSlack || 0)) >= remindSlackMs;
         const lineDue  = (fresh || (now - (was.lastLine || 0)) >= remindLineMs) && !quiet;
@@ -520,7 +575,10 @@ async function run() {
       }
 
       if (slackLines.length || lineLines.length) {
-        groups.push({ label: label, sailing: r.sailing, slackLines: slackLines, lineLines: lineLines });
+        groups.push({
+          label: label, route: t.route, holding: t.holding, sailing: r.sailing,
+          slackLines: slackLines, lineLines: lineLines,
+        });
       }
     }
 
@@ -541,15 +599,16 @@ async function run() {
         console.log('> 空席は続いていますが、通知済みのため今回は送りません'
           + (quiet ? '（静音時間帯。明けたらLINEも鳴らします）' : ''));
       } else if (checked > 0) {
-        console.log('> 希望3タイプに空きなし。監視を継続します。');
-      } else if (failed === 0) {
-        console.log('> 監視対象の日付が過ぎています。ワークフローを止めて構いません。');
+        console.log('> シングルツインの空きなし。監視を継続します。');
+      } else if (failed === 0 && skipped === 0) {
+        console.log('> 監視対象の日付がすべて過ぎています。ワークフローを止めて構いません。');
       }
     }
   } finally {
     await browser.close();
     saveState(next);
-    console.log('=== 終了（確認 ' + checked + '日 / 失敗 ' + failed + '日）===');
+    console.log('=== 終了（確認 ' + checked + '便 / スキップ ' + skipped
+      + '便 / 失敗 ' + failed + '便）===');
   }
 
   if (failed > 0) process.exitCode = 1;
