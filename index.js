@@ -28,11 +28,11 @@ const CONFIG = {
       grades: [TWIN],
     },
     {
-      y: 2026, m: 9, d: 22, line: '11',
-      route: '神戸 → 大分',
-      holding: '現在の予約：スタンダード（2）',
-      grades: [STANDARD, TWIN],
-    },
+  y: 2026, m: 9, d: 22, line: '11',
+  route: '神戸 → 大分',
+  holding: '現在の予約：スタンダード（2）',
+  grades: [STANDARD],
+},
   ],
 
   // --- 通知の間引き ---
