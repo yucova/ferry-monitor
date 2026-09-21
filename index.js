@@ -11,7 +11,7 @@ const fs = require('fs');
 // 等級名は「空白を除いたページ上の表記」と完全一致させること。
 // ※「プライベート ｼﾝｸﾞﾙ ﾂｲﾝ」はページ上が半角カナ。全角で書くと一生ヒットしません。
 const TWIN = { rank: 1, name: 'プライベートｼﾝｸﾞﾙﾂｲﾝ', label: 'プライベート シングルツイン' };
-
+const STANDARD = { rank: 2, name: 'スタンダード', label: 'スタンダード' };
 const CONFIG = {
   topUrl:     'https://booking.ferry-sunflower.co.jp/web/yoyaku/',
   bookingUrl: 'https://booking.ferry-sunflower.co.jp/web/yoyaku/',
@@ -20,24 +20,18 @@ const CONFIG = {
   passengers: { '大人': 1, '幼児': 1 },
 
   // 監視する便。出港日を過ぎたものは自動でスキップします
-  targets: [
+    targets: [
     {
-      y: 2026, m: 9, d: 21, line: '21',
+      y: 2026, m: 9, d: 22, line: '21',
       route: '大阪1 → 別府',
-      holding: 'プライベートシングル（確保済み）',
+      holding: '乗り換え候補（大阪発が取れたら切り替え）',
       grades: [TWIN],
     },
     {
-      y: 2026, m: 9, d: 23, line: '21',
-      route: '大阪1 → 別府（往路）',
-      holding: 'プライベートシングル（仮押さえ済み）',
-      grades: [TWIN],
-    },
-    {
-      y: 2026, m: 9, d: 24, line: '22',
-      route: '別府 → 大阪1（復路）',
-      holding: 'プライベートシングル（仮押さえ済み）',
-      grades: [TWIN],
+      y: 2026, m: 9, d: 22, line: '11',
+      route: '神戸 → 大分',
+      holding: '現在の予約：スタンダード（2）',
+      grades: [STANDARD, TWIN],
     },
   ],
 
